@@ -8,12 +8,14 @@
 #include <errno.h>
 #include <unistd.h>
 #include <vector>
+#include <unordered_map>
 #pragma comment (lib, "Ws2_32.lib")
 
 const size_t k_max_msg = 4096;
+const bool blocking = false;
 enum {
-    STATE_REQ = 0,
-    STATE_RES = 1,
+    STATE_REQ = 0,  // reading state
+    STATE_RES = 1,  // sending state
     STATE_END = 2,  // mark the connection for deletion
 };
 
@@ -27,6 +29,7 @@ struct Conn {
 
     // buffer for writing
     size_t wbuf_size = 0;
+    // Bytes sent till now
     size_t wbuf_sent = 0;
     char wbuf[4 + k_max_msg];
 };
@@ -52,7 +55,7 @@ static bool try_flush_buffer(Conn *conn) {
         rv = send(conn->fd, &conn->wbuf[conn->wbuf_sent], remain,0);
     } while (rv < 0 && errno == EINTR);
     if (rv < 0 && errno == EAGAIN) {
-        // got EAGAIN, stop.
+        // got EAGAIN(not ready), stop and no state change is needed.
         return false;
     }
     if (rv < 0) {
@@ -75,11 +78,103 @@ static bool try_flush_buffer(Conn *conn) {
 
 static void state_req(Conn *conn);
 static void state_res(Conn *conn);
+const size_t k_max_args = 1024;
+
+static int32_t parse_req(const char *data, size_t len, std::vector<std::string> &out){
+    if (len < 4) {
+        return -1;
+    }
+    uint32_t n = 0;
+    memcpy(&n, &data[0], 4);
+    if (n > k_max_args) {
+        return -1;
+    }
+
+    size_t pos = 4;
+    while (n--) {
+        if (pos + 4 > len) {
+            return -1;
+        }
+        uint32_t sz = 0;
+        memcpy(&sz, &data[pos], 4);
+        if (pos + 4 + sz > len) {
+            return -1;
+        }
+        out.push_back(std::string((char *)&data[pos + 4], sz));
+        pos += 4 + sz;
+    }
+    if (pos != len) {
+        return -1;  // trailing garbage
+    }
+    return 0;
+}
+
+static bool cmd_is(const std::string &word, const char *cmd) {
+    return 0 == strcasecmp(word.c_str(), cmd);
+}
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2,
+};
+
+static std::unordered_map<std::string, std::string> g_map;
+
+static uint32_t do_get(const std::vector<std::string> &cmd, char *res, uint32_t *reslen){
+    if (!g_map.count(cmd[1])) {
+        return RES_NX;
+    }
+    std::string &val = g_map[cmd[1]];
+    assert(val.size() <= k_max_msg);
+    memcpy(res, val.data(), val.size());
+    *reslen = (uint32_t)val.size();
+    return RES_OK;
+}
+
+static uint32_t do_set(const std::vector<std::string> &cmd, char *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+    g_map[cmd[1]] = cmd[2];
+    return RES_OK;
+}
+
+static uint32_t do_del(const std::vector<std::string> &cmd, char *res, uint32_t *reslen)
+{
+    (void)res;
+    (void)reslen;
+    g_map.erase(cmd[1]);
+    return RES_OK;
+}
+
+static int32_t do_request(const char *req, uint32_t reqlen,
+    uint32_t *rescode, char *res, uint32_t *reslen){
+        std::vector<std::string> cmd;
+        if (0 != parse_req(req, reqlen, cmd)) {
+            msg("bad req");
+            return -1;
+        }
+        if (cmd.size() == 2 && cmd_is(cmd[0], "get")) {
+        *rescode = do_get(cmd, res, reslen);
+        } else if (cmd.size() == 3 && cmd_is(cmd[0], "set")) {
+        *rescode = do_set(cmd, res, reslen);
+        } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
+        *rescode = do_del(cmd, res, reslen);
+        } else {
+            // cmd is not recognized
+            *rescode = RES_ERR;
+            const char *msg = "Unknown cmd";
+            strcpy((char *)res, msg);
+            *reslen = strlen(msg);
+            return 0;
+        }
+    return 0;
+}
 
 static bool try_one_request(Conn *conn) {
     // try to parse a request from the buffer
     if (conn->rbuf_size < 4) {
-        // not enough data in the buffer. Will retry in the next iteration
+        // not enough data in the buffer to get length of msg. Will retry in the next iteration
         return false;
     }
     uint32_t len = 0;
@@ -90,16 +185,25 @@ static bool try_one_request(Conn *conn) {
         return false;
     }
     if (4 + len > conn->rbuf_size) {
-        // not enough data in the buffer. Will retry in the next iteration
+        // buffer contains less data than mentiond. Will retry in the next iteration
         return false;
     }
 
-    // got one request, do something with it
-    printf("client says: %.*s\n", len, &conn->rbuf[4]);
+    // got one request lets generate  the responce
+    //printf("client says: %.*s\n", len, &conn->rbuf[4]);
+    uint32_t rescode = 0;
+    uint32_t wlen = 0;
+    int32_t err = do_request(&conn->rbuf[4], len,&rescode, &conn->wbuf[4 + 4], &wlen);
+    if (err) {
+        conn->state = STATE_END;
+        return false;
+    }
+
 
     // generating echoing response
-    memcpy(&conn->wbuf[0], &len, 4);
-    memcpy(&conn->wbuf[4], &conn->rbuf[4], len);
+    wlen += 4;
+    memcpy(&conn->wbuf[0], &wlen, 4);
+    memcpy(&conn->wbuf[4], &rescode, 4);
     conn->wbuf_size = 4 + len;
 
     // remove the request from the buffer.
@@ -132,7 +236,8 @@ static bool try_fill_buffer(Conn *conn) {
         return false;
     }
     if (rv < 0) {
-        msg("read() error");
+        if(10035 == WSAGetLastError()) msg("No data is queued to be read from the socket");
+        else msg("read() error");
         conn->state = STATE_END;
         return false;
     }
@@ -150,7 +255,7 @@ static bool try_fill_buffer(Conn *conn) {
     assert(conn->rbuf_size <= sizeof(conn->rbuf));
 
     // Try to process requests one by one.
-    // "pipelining".
+    // "pipelining": we will process next request of client before sending responce to previous one
     while (try_one_request(conn)) {}
     return (conn->state == STATE_REQ);
 }
@@ -164,11 +269,10 @@ static void state_res(Conn *conn) {
 }
 
 static void fd_set_nb(int fd){
-    bool blocking=false;
     unsigned long mode = blocking ? 0 : 1;
     int res=ioctlsocket(fd, FIONBIO, &mode);
     if(res!= NO_ERROR){
-        die("fcntl error");
+        die("nonblocking error");
         return;
     }
 }
@@ -237,20 +341,18 @@ int main(){
     }
 
     int val=1;
-    //configure
+    //configure socket such that other server and reuse same port
     setsockopt(fd,SOL_SOCKET,SO_REUSEADDR, (char *) &val, sizeof(val));
 
     //bind
     struct sockaddr_in addr = {};
+    //Ipv4
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
 
     // wildcard address 0.0.0.0
     addr.sin_addr.s_addr = ntohl(0);
     int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
-
-
-    //this is more like exception 
     if (rv == SOCKET_ERROR) {
         printf("bind failed with error: %d\n", WSAGetLastError());
         WSACleanup();
@@ -262,10 +364,10 @@ int main(){
     if (rv) {
         die("listen()");
     }
+    msg("Server started listening successfully");
 
-    std::cout<<"Server is running\n";
-
-    //all client connections key is fd
+    //all client connections key is fd 
+    //this can be a unordered map
     std::vector<Conn*> fd2conn;
 
     // set the listen fd to nonblocking mode
@@ -288,6 +390,8 @@ int main(){
             }
             struct pollfd pfd = {};
             pfd.fd = conn->fd;
+            //for reading state wait till data can be read(POLLIN) with out blocking
+            // and for writing till data can be written(POLLOUT) with out blocking
             pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
             poll_args.push_back(pfd);
         }
@@ -299,7 +403,7 @@ int main(){
         }
 
         for (size_t i = 1; i < poll_args.size(); ++i) {
-            //if ready
+            //If revents is set then that is non blocking action
             if (poll_args[i].revents) {
                 Conn *conn = fd2conn[poll_args[i].fd];
                 connection_io(conn);
